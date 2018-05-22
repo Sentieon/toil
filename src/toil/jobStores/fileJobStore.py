@@ -231,7 +231,17 @@ class FileJobStore(AbstractJobStore):
 
     def _exportFile(self, otherCls, jobStoreFileID, url):
         if issubclass(otherCls, FileJobStore):
-            shutil.copyfile(self._getAbsPath(jobStoreFileID), self._extractPathFromUrl(url))
+            absPath = self._getAbsPath(jobStoreFileID)
+            localFilePath = self._extractPathFromUrl(url)
+            copied = False
+            if bool(os.environ.get('FILEJOBSTORE_LINK_OUTPUT', 'true')) and not os.path.islink(absPath):
+                try:
+                    os.link(absPath, localFilePath)
+                    copied = True
+                except OSError as e:
+                    pass
+            if not copied:
+                shutil.copyfile(absPath, localFilePath)
         else:
             super(FileJobStore, self)._exportFile(otherCls, jobStoreFileID, url)
 
@@ -291,7 +301,15 @@ class FileJobStore(AbstractJobStore):
         else:
             sourceFunctionName = "x"
         absPath = self._getUniqueName(localFilePath, jobStoreID, sourceFunctionName)
-        shutil.copyfile(localFilePath, absPath)
+        copied = False
+        if bool(os.environ.get('FILEJOBSTORE_LINK_OUTPUT', 'true')) and not os.path.islink(localFilePath):
+            try:
+                os.link(localFilePath, absPath)
+                copied = True
+            except OSError as e:
+                pass
+        if not copied:
+            shutil.copyfile(localFilePath, absPath)
         return self._getRelativePath(absPath)
 
     @contextmanager
