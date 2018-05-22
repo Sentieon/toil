@@ -13,8 +13,8 @@
 #
 
 def _gridengineBatchSystemFactory():
-    from toil.batchSystems.gridengine import GridengineBatchSystem
-    return GridengineBatchSystem
+    from toil.batchSystems.gridengine import GridEngineBatchSystem
+    return GridEngineBatchSystem
 
 def _parasolBatchSystemFactory():
     from toil.batchSystems.parasol import ParasolBatchSystem
@@ -35,8 +35,16 @@ def _mesosBatchSystemFactory():
 def _slurmBatchSystemFactory():
     from toil.batchSystems.slurm import SlurmBatchSystem
     return SlurmBatchSystem
-    
-    
+
+def _torqueBatchSystemFactory():
+    from toil.batchSystems.torque import TorqueBatchSystem
+    return TorqueBatchSystem
+
+def _htcondorBatchSystemFactory():
+    from toil.batchSystems.htcondor import HTCondorBatchSystem
+    return HTCondorBatchSystem
+
+
 _DEFAULT_REGISTRY = {
     'parasol'        : _parasolBatchSystemFactory,
     'singleMachine'  : _singleMachineBatchSystemFactory,
@@ -48,7 +56,11 @@ _DEFAULT_REGISTRY = {
     'mesos'          : _mesosBatchSystemFactory,
     'Mesos'          : _mesosBatchSystemFactory,
     'slurm'          : _slurmBatchSystemFactory,
-    'Slurm'          : _slurmBatchSystemFactory
+    'Slurm'          : _slurmBatchSystemFactory,
+    'torque'         : _torqueBatchSystemFactory,
+    'Torque'         : _torqueBatchSystemFactory,
+    'htcondor'       : _htcondorBatchSystemFactory,
+    'HTCondor'       : _htcondorBatchSystemFactory
     }
 
 _UNIQUE_NAME = {
@@ -57,7 +69,9 @@ _UNIQUE_NAME = {
     'gridEngine',
     'LSF',
     'Mesos',
-    'Slurm'
+    'Slurm',
+    'Torque',
+    'HTCondor'
         }
 
 _batchSystemRegistry = _DEFAULT_REGISTRY.copy()

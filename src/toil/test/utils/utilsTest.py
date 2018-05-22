@@ -14,11 +14,11 @@
 
 from __future__ import absolute_import
 
+from builtins import str
 import os
 import sys
 import uuid
 import shutil
-from subprocess import CalledProcessError, check_call
 import tempfile
 
 import pytest
@@ -26,13 +26,15 @@ import pytest
 import toil
 import logging
 import toil.test.sort.sort
+from toil import subprocess
 from toil import resolveEntryPoint
 from toil.job import Job
 from toil.lib.bioio import getTempFile, system
-from toil.test import ToilTest, needs_aws, needs_rsync3, integrative
+from toil.test import ToilTest, needs_aws, needs_rsync3, integrative, slow
 from toil.test.sort.sortTest import makeFileToSort
 from toil.utils.toilStats import getStats, processData
 from toil.common import Toil, Config
+from toil.provisioners import clusterFactory
 
 
 logger = logging.getLogger(__name__)
@@ -48,7 +50,7 @@ class UtilsTest(ToilTest):
         super(UtilsTest, self).setUp()
         self.tempDir = self._createTempDir()
         self.tempFile = getTempFile(rootDir=self.tempDir)
-        self.outputFile = getTempFile(rootDir=self.tempDir)
+        self.outputFile = 'someSortedStuff.txt'
         self.toilDir = os.path.join(self.tempDir, "jobstore")
         self.assertFalse(os.path.exists(self.toilDir))
         self.lines = 1000
@@ -86,14 +88,14 @@ class UtilsTest(ToilTest):
     @pytest.mark.timeout(1200)
     @needs_aws
     @integrative
+    @slow
     def testAWSProvisionerUtils(self):
         clusterName = 'cluster-utils-test' + str(uuid.uuid4())
         keyName = os.getenv('TOIL_AWS_KEYNAME')
-
         try:
             # --provisioner flag should default to aws, so we're not explicitly
             # specifying that here
-            system([self.toilMain, 'launch-cluster', '--nodeType=t2.micro',
+            system([self.toilMain, 'launch-cluster', '--leaderNodeType=t2.micro',
                     '--keyPairName=' + keyName, clusterName])
         finally:
             system([self.toilMain, 'destroy-cluster', '--provisioner=aws', clusterName])
@@ -104,20 +106,22 @@ class UtilsTest(ToilTest):
             tags = {'Name': clusterName, 'Owner': keyName}
             tags.update(userTags)
 
-            # launch preemptable master with same name
+            # launch master with same name
             system([self.toilMain, 'launch-cluster', '-t', 'key1=value1', '-t', 'key2=value2', '--tag', 'key3=value3',
-                    '--nodeType=m3.medium:0.2', '--keyPairName=' + keyName, clusterName,
+                    '--leaderNodeType=m3.medium', '--keyPairName=' + keyName, clusterName,
                     '--provisioner=aws', '--logLevel=DEBUG'])
 
+            cluster = clusterFactory(provisioner='aws', clusterName=clusterName)
+            leader = cluster.getLeader()
             # test leader tags
-            leaderTags = AWSProvisioner._getLeader(clusterName).tags
-            self.assertEqual(tags, leaderTags)
+            for key in tags.keys():
+                self.assertEqual(tags[key], leader.tags.get(key))
 
             # Test strict host key checking
             # Doesn't work when run locally.
             if(keyName == 'jenkins@jenkins-master'):
                 try:
-                    AWSProvisioner.sshLeader(clusterName=clusterName, strict=True)
+                    leader.sshAppliance(strict=True)
                 except RuntimeError:
                     pass
                 else:
@@ -125,7 +129,7 @@ class UtilsTest(ToilTest):
 
             # Add the host key to known_hosts so that the rest of the tests can
             # pass without choking on the verification prompt.
-            AWSProvisioner.sshLeader(clusterName=clusterName, strict=True, sshOptions=['-oStrictHostKeyChecking=no'])
+            leader.sshAppliance('bash', strict=True, sshOptions=['-oStrictHostKeyChecking=no'])
 
             system([self.toilMain, 'ssh-cluster', '--provisioner=aws', clusterName])
 
@@ -143,21 +147,17 @@ class UtilsTest(ToilTest):
             for test in testStrings:
                 logger.info('Testing SSH with special string: %s', test)
                 compareTo = "import sys; assert sys.argv[1]==%r" % test
-                AWSProvisioner.sshLeader(clusterName=clusterName,
-                                         args=['python', '-', test],
-                                         input=compareTo)
+                leader.sshAppliance('python', '-', test, input=compareTo)
 
             try:
-                AWSProvisioner.sshLeader(clusterName=clusterName,
-                                         args=['nonsenseShouldFail'])
+                leader.sshAppliance('nonsenseShouldFail')
             except RuntimeError:
                 pass
             else:
                 self.fail('The remote command failed silently where it should have '
                           'raised an error')
 
-            AWSProvisioner.sshLeader(clusterName=clusterName,
-                                     args=['python', '-c', "import os; assert os.environ['TOIL_WORKDIR']=='/var/lib/toil'"])
+            leader.sshAppliance('python', '-c', "import os; assert os.environ['TOIL_WORKDIR']=='/var/lib/toil'")
 
             # `toil rsync-cluster`
             # Testing special characters - string.punctuation
@@ -168,13 +168,13 @@ class UtilsTest(ToilTest):
                 tmpFile.write(testData)
                 tmpFile.flush()
                 # Upload file to leader
-                AWSProvisioner.rsyncLeader(clusterName=clusterName, args=[tmpFile.name, ":"])
+                leader.coreRsync(args=[tmpFile.name, ":"])
                 # Ensure file exists
-                AWSProvisioner.sshLeader(clusterName=clusterName, args=["test", "-e", relpath])
+                leader.sshAppliance("test", "-e", relpath)
             tmpDir = tempfile.mkdtemp()
             # Download the file again and make sure it's the same file
             # `--protect-args` needed because remote bash chokes on special characters
-            AWSProvisioner.rsyncLeader(clusterName=clusterName, args=["--protect-args", ":" + relpath, tmpDir])
+            leader.coreRsync(args=["--protect-args", ":" + relpath, tmpDir])
             with open(os.path.join(tmpDir, relpath), "r") as f:
                 self.assertEqual(f.read(), testData, "Downloaded file does not match original file")
         finally:
@@ -184,6 +184,7 @@ class UtilsTest(ToilTest):
             except NameError:
                 pass
 
+    @slow
     def testUtilsSort(self):
         """
         Tests the status and stats commands of the toil command line utility using the
@@ -196,13 +197,14 @@ class UtilsTest(ToilTest):
                        self.toilDir,
                        '--logLevel=DEBUG',
                        '--fileToSort', self.tempFile,
+                       '--outputFile', self.outputFile,
                        '--N', str(self.N),
                        '--stats',
                        '--retryCount=2',
                        '--badWorker=0.5',
                        '--badWorkerFailInterval=0.05']
         # Try restarting it to check that a JobStoreException is thrown
-        self.assertRaises(CalledProcessError, system, toilCommand + ['--restart'])
+        self.assertRaises(subprocess.CalledProcessError, system, toilCommand + ['--restart'])
         # Check that trying to run it in restart mode does not create the jobStore
         self.assertFalse(os.path.exists(self.toilDir))
 
@@ -211,14 +213,14 @@ class UtilsTest(ToilTest):
         try:
             system(toilCommand)
             finished = True
-        except CalledProcessError:  # This happens when the script fails due to having unfinished jobs
+        except subprocess.CalledProcessError:  # This happens when the script fails due to having unfinished jobs
             system(self.statusCommand())
-            self.assertRaises(CalledProcessError, system, self.statusCommand(failIfNotComplete=True))
+            self.assertRaises(subprocess.CalledProcessError, system, self.statusCommand(failIfNotComplete=True))
             finished = False
         self.assertTrue(os.path.exists(self.toilDir))
 
         # Try running it without restart and check an exception is thrown
-        self.assertRaises(CalledProcessError, system, toilCommand)
+        self.assertRaises(subprocess.CalledProcessError, system, toilCommand)
 
         # Now restart it until done
         totalTrys = 1
@@ -226,9 +228,9 @@ class UtilsTest(ToilTest):
             try:
                 system(toilCommand + ['--restart'])
                 finished = True
-            except CalledProcessError:  # This happens when the script fails due to having unfinished jobs
+            except subprocess.CalledProcessError:  # This happens when the script fails due to having unfinished jobs
                 system(self.statusCommand())
-                self.assertRaises(CalledProcessError, system, self.statusCommand(failIfNotComplete=True))
+                self.assertRaises(subprocess.CalledProcessError, system, self.statusCommand(failIfNotComplete=True))
                 if totalTrys > 16:
                     self.fail()  # Exceeded a reasonable number of restarts
                 totalTrys += 1
@@ -236,20 +238,21 @@ class UtilsTest(ToilTest):
                 # Check the toil status command does not issue an exception
         system(self.statusCommand())
 
-        # Check if we try to launch after its finished that we get a JobException
-        self.assertRaises(CalledProcessError, system, toilCommand + ['--restart'])
-
         # Check we can run 'toil stats'
         system(self.statsCommand)
 
         # Check the file is properly sorted
-        with open(self.tempFile, 'r') as fileHandle:
+        with open(self.outputFile, 'r') as fileHandle:
             l2 = fileHandle.readlines()
             self.assertEquals(self.correctSort, l2)
+
+        # Delete output file before next step
+        os.remove(self.outputFile)
 
         # Check we can run 'toil clean'
         system(self.cleanCommand)
 
+    @slow
     def testUtilsStatsSort(self):
         """
         Tests the stats commands on a complete run of the stats test.
@@ -260,6 +263,7 @@ class UtilsTest(ToilTest):
                        self.toilDir,
                        '--logLevel=DEBUG',
                        '--fileToSort', self.tempFile,
+                       '--outputFile', self.outputFile,
                        '--N', str(self.N),
                        '--stats',
                        '--retryCount=99',
@@ -274,9 +278,12 @@ class UtilsTest(ToilTest):
         system(self.statsCommand)
 
         # Check the file is properly sorted
-        with open(self.tempFile, 'r') as fileHandle:
+        with open(self.outputFile, 'r') as fileHandle:
             l2 = fileHandle.readlines()
             self.assertEquals(self.correctSort, l2)
+
+        # Delete output file
+        os.remove(self.outputFile)
 
     def testUnicodeSupport(self):
         options = Job.Runner.getDefaultOptions(self._getTestJobStorePath())
@@ -284,6 +291,7 @@ class UtilsTest(ToilTest):
         options.logLevel = 'debug'
         Job.Runner.startToil(Job.wrapFn(printUnicodeCharacter), options)
 
+    @slow
     def testMultipleJobsPerWorkerStats(self):
         """
         Tests case where multiple jobs are run on 1 worker to insure that all jobs report back their data
@@ -304,7 +312,7 @@ def printUnicodeCharacter():
     # We want to get a unicode character to stdout but we can't print it directly because of
     # Python encoding issues. To work around this we print in a separate Python process. See
     # http://stackoverflow.com/questions/492483/setting-the-correct-encoding-when-piping-stdout-in-python
-    check_call([sys.executable, '-c', "print '\\xc3\\xbc'"])
+    subprocess.check_call([sys.executable, '-c', "print '\\xc3\\xbc'"])
 
 class RunTwoJobsPerWorker(Job):
     """

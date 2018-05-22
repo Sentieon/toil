@@ -13,6 +13,13 @@
 # limitations under the License.
 
 from __future__ import absolute_import
+from __future__ import division
+from builtins import str
+from past.builtins import str as oldstr
+from builtins import next
+from builtins import range
+from past.utils import old_div
+from builtins import object
 import base64
 import bz2
 import os
@@ -21,25 +28,22 @@ import logging
 import types
 
 import errno
-from contextlib import closing
 from ssl import SSLError
-from multiprocessing import cpu_count
 
 # Python 3 compatibility imports
 import itertools
 
 
-import boto
-from bd2k.util.exceptions import panic
-from concurrent.futures import ThreadPoolExecutor
+from toil.lib.exceptions import panic
 from six import iteritems
 
-from bd2k.util.retry import retry
+from toil.lib.retry import retry
 from boto.exception import (SDBResponseError,
                             BotoServerError,
                             S3ResponseError,
                             S3CreateError,
                             S3CopyError)
+import boto3
 
 log = logging.getLogger(__name__)
 
@@ -51,13 +55,13 @@ class SDBHelper(object):
     >>> import os
     >>> H=SDBHelper
     >>> H.presenceIndicator()
-    '000'
+    u'000'
     >>> H.binaryToAttributes(None)
     {}
     >>> H.attributesToBinary({})
     (None, 0)
     >>> H.binaryToAttributes('')
-    {'000': 'VQ=='}
+    {u'000': 'VQ=='}
     >>> H.attributesToBinary({'000': 'VQ=='})
     ('', 1)
 
@@ -92,7 +96,9 @@ class SDBHelper(object):
 
     maxAttributesPerItem = 256
     maxValueSize = 1024
-    maxRawValueSize = maxValueSize * 3 / 4
+    # in python2 1 / 2 == 0, in python 3 1 / 2 == 0.5
+    # old_div implents the python2 behavior in both 2 & 3
+    maxRawValueSize = old_div(maxValueSize * 3, 4)
     # Just make sure we don't have a problem with padding or integer truncation:
     assert len(base64.b64encode(' ' * maxRawValueSize)) == 1024
     assert len(base64.b64encode(' ' * (1 + maxRawValueSize))) > 1024
@@ -197,7 +203,7 @@ def uploadFromPath(localFilePath, partSize, bucket, fileID, headers):
     """
     file_size, file_time = fileSizeAndTime(localFilePath)
     if file_size <= partSize:
-        key = bucket.new_key(key_name=fileID)
+        key = bucket.new_key(key_name=bytes(fileID))
         key.name = fileID
         for attempt in retry_s3():
             with attempt:
@@ -208,7 +214,7 @@ def uploadFromPath(localFilePath, partSize, bucket, fileID, headers):
             version = chunkedFileUpload(f, bucket, fileID, file_size, headers, partSize)
     for attempt in retry_s3():
         with attempt:
-            key = bucket.get_key(fileID,
+            key = bucket.get_key(bytes(fileID),
                                  headers=headers,
                                  version_id=version)
     assert key.size == file_size
@@ -221,7 +227,7 @@ def chunkedFileUpload(readable, bucket, fileID, file_size, headers=None, partSiz
     for attempt in retry_s3():
         with attempt:
             upload = bucket.initiate_multipart_upload(
-                key_name=fileID,
+                key_name=bytes(fileID),
                 headers=headers)
     try:
         start = 0
@@ -249,83 +255,57 @@ def chunkedFileUpload(readable, bucket, fileID, file_size, headers=None, partSiz
     return version
 
 
-def copyKeyMultipart(srcKey, dstBucketName, dstKeyName, partSize, headers=None):
+def copyKeyMultipart(srcBucketName, srcKeyName, srcKeyVersion, dstBucketName, dstKeyName, sseAlgorithm=None, sseKey=None,
+                     copySourceSseAlgorithm=None, copySourceSseKey=None):
     """
     Copies a key from a source key to a destination key in multiple parts. Note that if the
     destination key exists it will be overwritten implicitly, and if it does not exist a new
     key will be created. If the destination bucket does not exist an error will be raised.
 
-    :param boto.s3.key.Key srcKey: The source key to be copied from.
+    :param str srcBucketName: The name of the bucket to be copied from.
+    :param str srcKeyName: The name of the key to be copied from.
+    :param str srcKeyVersion: The version of the key to be copied from.
     :param str dstBucketName: The name of the destination bucket for the copy.
     :param str dstKeyName: The name of the destination key that will be created or overwritten.
-    :param int partSize: The size of each individual part, must be >= 5 MiB but large enough to
-           not exceed 10k parts for the whole file
-    :param dict headers: Any headers that should be passed.
+    :param str sseAlgorithm: Server-side encryption algorithm for the destination.
+    :param str sseKey: Server-side encryption key for the destination.
+    :param str copySourceSseAlgorithm: Server-side encryption algorithm for the source.
+    :param str copySourceSseKey: Server-side encryption key for the source.
 
-    :rtype: boto.s3.multipart.CompletedMultiPartUpload
-    :return: An object representing the completed upload.
+    :rtype: str
+    :return: The version of the copied file (or None if versioning is not enabled for dstBucket).
     """
+    s3 = boto3.resource('s3')
+    dstBucket = s3.Bucket(oldstr(dstBucketName))
+    dstObject = dstBucket.Object(oldstr(dstKeyName))
+    copySource = {'Bucket': oldstr(srcBucketName), 'Key': oldstr(srcKeyName)}
+    if srcKeyVersion is not None:
+        copySource['VersionId'] = oldstr(srcKeyVersion)
 
-    def copyPart(partIndex):
-        if exceptions:
-            return None
-        try:
-            for attempt in retry_s3():
-                with attempt:
-                    start = partIndex * partSize
-                    end = min(start + partSize, totalSize)
-                    part = upload.copy_part_from_key(src_bucket_name=srcKey.bucket.name,
-                                                     src_key_name=srcKey.name,
-                                                     src_version_id=srcKey.version_id,
-                                                     # S3 part numbers are 1-based
-                                                     part_num=partIndex + 1,
-                                                     # S3 range intervals are closed at the end
-                                                     start=start, end=end - 1,
-                                                     headers=headers)
-        except Exception as e:
-            if len(exceptions) < 5:
-                exceptions.append(e)
-                log.error('Failed to copy part number %d:', partIndex, exc_info=True)
-            else:
-                log.warn('Also failed to copy part number %d due to %s.', partIndex, e)
-            return None
-        else:
-            log.debug('Successfully copied part %d of %d.', partIndex, totalParts)
-            # noinspection PyUnboundLocalVariable
-            return part
+    # The boto3 functions don't allow passing parameters as None to
+    # indicate they weren't provided. So we have to do a bit of work
+    # to ensure we only provide the parameters when they are actually
+    # required.
+    destEncryptionArgs = {}
+    if sseKey is not None:
+        destEncryptionArgs.update({'SSECustomerAlgorithm': sseAlgorithm,
+                                   'SSECustomerKey': sseKey})
+    copyEncryptionArgs = {}
+    if copySourceSseKey is not None:
+        copyEncryptionArgs.update({'CopySourceSSECustomerAlgorithm': copySourceSseAlgorithm,
+                                   'CopySourceSSECustomerKey': copySourceSseKey})
+    copyEncryptionArgs.update(destEncryptionArgs)
 
-    totalSize = srcKey.size
-    totalParts = (totalSize + partSize - 1) / partSize
-    exceptions = []
-    # We need a location-agnostic connection to S3 so we can't use the one that we
-    # normally use for interacting with the job store bucket.
-    with closing(boto.connect_s3()) as s3:
-        for attempt in retry_s3():
-            with attempt:
-                dstBucket = s3.get_bucket(dstBucketName)
-                upload = dstBucket.initiate_multipart_upload(dstKeyName, headers=headers)
-        log.info("Initiated multipart copy from 's3://%s/%s' to 's3://%s/%s'.",
-                 srcKey.bucket.name, srcKey.name, dstBucketName, dstKeyName)
-        try:
-            # We can oversubscribe cores by at least a factor of 16 since each copy task just
-            # blocks, waiting on the server. Limit # of threads to 128, since threads aren't
-            # exactly free either. Lastly, we don't need more threads than we have parts.
-            with ThreadPoolExecutor(max_workers=min(cpu_count() * 16, totalParts, 128)) as executor:
-                parts = list(executor.map(copyPart, xrange(0, totalParts)))
-                if exceptions:
-                    raise RuntimeError('Failed to copy at least %d part(s)' % len(exceptions))
-                assert len(filter(None, parts)) == totalParts
-        except:
-            with panic(log=log):
-                upload.cancel_upload()
-        else:
-            for attempt in retry_s3():
-                with attempt:
-                    completed = upload.complete_upload()
-                    log.info("Completed copy from 's3://%s/%s' to 's3://%s/%s'.",
-                             srcKey.bucket.name, srcKey.name, dstBucketName, dstKeyName)
-                    return completed
+    dstObject.copy(copySource, ExtraArgs=copyEncryptionArgs)
 
+    # Unfortunately, boto3's managed copy doesn't return the version
+    # that it actually copied to. So we have to check immediately
+    # after, leaving open the possibility that it may have been
+    # modified again in the few seconds since the copy finished. There
+    # isn't much we can do about it.
+    info = boto3.client('s3').head_object(Bucket=dstObject.bucket_name, Key=dstObject.key,
+                                          **destEncryptionArgs)
+    return info.get('VersionId', None)
 
 def _put_attributes_using_post(self, domain_or_name, item_name, attributes,
                                replace=True, expected_value=None):
@@ -392,12 +372,14 @@ def retry_sdb(delays=default_delays, timeout=default_timeout, predicate=retryabl
 
 
 def retryable_s3_errors(e):
-    return (isinstance(e, (S3CreateError, S3ResponseError))
-            and e.status == 409
-            and 'try again' in e.message
+    return ((isinstance(e, (S3CreateError, S3ResponseError))
+             and e.status == 409
+             and 'try again' in e.message)
             or connection_reset(e)
-            or isinstance(e, BotoServerError) and e.status == 500
-            or isinstance(e, S3CopyError) and 'try again' in e.message)
+            or (isinstance(e, BotoServerError) and e.status == 500)
+            # Throttling response sometimes received on bucket creation
+            or (isinstance(e, BotoServerError) and e.status == 503 and e.code == 'SlowDown')
+            or (isinstance(e, S3CopyError) and 'try again' in e.message))
 
 
 def retry_s3(delays=default_delays, timeout=default_timeout, predicate=retryable_s3_errors):

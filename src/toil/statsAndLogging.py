@@ -14,6 +14,8 @@
 
 from __future__ import absolute_import
 
+from builtins import str
+from builtins import object
 import gzip
 import json
 import logging
@@ -21,7 +23,7 @@ import os
 import time
 from threading import Thread, Event
 
-from bd2k.util.expando import Expando
+from toil.lib.expando import Expando
 from toil.lib.bioio import getTotalCpuTime
 
 logger = logging.getLogger( __name__ )

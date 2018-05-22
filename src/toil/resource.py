@@ -14,6 +14,9 @@
 
 from __future__ import absolute_import
 
+from future import standard_library
+standard_library.install_aliases()
+from builtins import map
 import errno
 import hashlib
 import importlib
@@ -27,16 +30,15 @@ from contextlib import closing
 from io import BytesIO
 from pydoc import locate
 from tempfile import mkdtemp
-from urllib2 import HTTPError
+from urllib.error import HTTPError
 from zipfile import ZipFile
 
 # Python 3 compatibility imports
-from bd2k.util.retry import retry
+from toil.lib.retry import retry
 from six.moves.urllib.request import urlopen
 
-from bd2k.util import strict_bool
-from bd2k.util.iterables import concat
-from bd2k.util.exceptions import require
+from toil.lib.memoize import strict_bool
+from toil.lib.iterables import concat
 
 from toil import inVirtualEnv
 
@@ -122,7 +124,7 @@ class Resource(namedtuple('Resource', ('name', 'pathHash', 'url', 'contentHash')
         resourceRootDirPath = os.environ[cls.rootDirPathEnvName]
         os.environ.pop(cls.rootDirPathEnvName)
         shutil.rmtree(resourceRootDirPath)
-        for k, v in os.environ.items():
+        for k, v in list(os.environ.items()):
             if k.startswith(cls.resourceEnvNamePrefix):
                 os.environ.pop(k)
 
@@ -145,9 +147,10 @@ class Resource(namedtuple('Resource', ('name', 'pathHash', 'url', 'contentHash')
         """
         pathHash = cls._pathHash(leaderPath)
         try:
-            s = os.environ[cls.resourceEnvNamePrefix + pathHash]
+            path_key = cls.resourceEnvNamePrefix + pathHash
+            s = os.environ[path_key]
         except KeyError:
-            log.warn("Can't find resource for leader path '%s'", leaderPath)
+            log.warn("'%s' may exist, but is not yet referenced by the worker (KeyError from os.environ[]).", str(path_key))
             return None
         else:
             self = cls.unpickle(s)
@@ -378,8 +381,8 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
         filePath = os.path.abspath(module.__file__)
         filePath = filePath.split(os.path.sep)
         filePath[-1], extension = os.path.splitext(filePath[-1])
-        require(extension in ('.py', '.pyc'),
-                'The name of a user script/module must end in .py or .pyc.')
+        if not extension in ('.py', '.pyc'):
+            raise Exception('The name of a user script/module must end in .py or .pyc.')
         if name == '__main__':
             log.debug("Discovering real name of module")
             # User script/module was invoked as the main program
@@ -409,9 +412,8 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
                 assert dirPathTail == package
             dirPath = os.path.sep.join(filePath)
         log.debug("Module dir is %s", dirPath)
-        require(os.path.isdir(dirPath),
-                'Bad directory path %s for module %s. Note that hot-deployment does not support \
-                .egg-link files yet, or scripts located in the root directory.', dirPath, name)
+        if not os.path.isdir(dirPath):
+            raise Exception('Bad directory path %s for module %s. Note that hot-deployment does not support .egg-link files yet, or scripts located in the root directory.' % (dirPath, name))
         fromVirtualEnv = inVirtualEnv() and dirPath.startswith(sys.prefix)
         return cls(dirPath=dirPath, name=name, fromVirtualEnv=fromVirtualEnv)
 
@@ -457,7 +459,7 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
 
     def _getResourceClass(self):
         """
-        Return the concrete subclass of Resource that's appropriate for hot-deploying this module.
+        Return the concrete subclass of Resource that's appropriate for auto-deploying this module.
         """
         if self.fromVirtualEnv:
             subcls = VirtualEnvResource
@@ -483,7 +485,6 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
             log.warn('The localize() method should only be invoked on a worker.')
         resource = Resource.lookup(self._resourcePath)
         if resource is None:
-            log.warn("Can't localize module %r", self)
             return self
         else:
             def stash(tmpDirPath):
@@ -504,7 +505,15 @@ class ModuleDescriptor(namedtuple('ModuleDescriptor', ('dirPath', 'name', 'fromV
             log.warning('Cannot determine main program module.')
             return False
         else:
-            mainModuleFile = os.path.basename(mainModule.__file__)
+            # If __file__ is not a valid attribute, it's because
+            # toil is being run interactively, in which case
+            # we can reasonably assume that we are not running
+            # on a worker node.
+            try:
+                mainModuleFile = os.path.basename(mainModule.__file__)
+            except AttributeError:
+                return False
+
             workerModuleFiles = concat(('worker' + ext for ext in self.moduleExtensions),
                                        '_toil_worker')  # the setuptools entry point
             return mainModuleFile in workerModuleFiles

@@ -14,10 +14,12 @@
 
 from __future__ import absolute_import
 
+from builtins import filter
+from builtins import str
+from builtins import object
 import ast
 import logging
 import os
-import pickle
 import pwd
 import socket
 import time
@@ -25,7 +27,11 @@ import sys
 from contextlib import contextmanager
 from struct import unpack
 
-import itertools
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
+
 
 # Python 3 compatibility imports
 from six.moves.queue import Empty, Queue
@@ -33,19 +39,19 @@ from six import iteritems, itervalues
 
 import mesos.interface
 import mesos.native
-from bd2k.util import strict_bool
+from toil.lib.memoize import strict_bool
 from mesos.interface import mesos_pb2
 
 from toil import resolveEntryPoint
 from toil.batchSystems.abstractBatchSystem import (AbstractScalableBatchSystem,
-                                                   BatchSystemSupport,
+                                                   BatchSystemLocalSupport,
                                                    NodeInfo)
 from toil.batchSystems.mesos import ToilJob, ResourceRequirement, TaskData, JobQueue
 
 log = logging.getLogger(__name__)
 
 
-class MesosBatchSystem(BatchSystemSupport,
+class MesosBatchSystem(BatchSystemLocalSupport,
                        AbstractScalableBatchSystem,
                        mesos.interface.Scheduler):
     """
@@ -60,7 +66,7 @@ class MesosBatchSystem(BatchSystemSupport,
     """
 
     @classmethod
-    def supportsHotDeployment(cls):
+    def supportsAutoDeployment(cls):
         return True
 
     @classmethod
@@ -78,7 +84,7 @@ class MesosBatchSystem(BatchSystemSupport,
     def __init__(self, config, maxCores, maxMemory, maxDisk):
         super(MesosBatchSystem, self).__init__(config, maxCores, maxMemory, maxDisk)
 
-        # The hot-deployed resource representing the user script. Will be passed along in every
+        # The auto-deployed resource representing the user script. Will be passed along in every
         # Mesos task. Also see setUserScript().
         self.userScript = None
         """
@@ -139,7 +145,6 @@ class MesosBatchSystem(BatchSystemSupport,
 
         self.executor = self._buildExecutor()
 
-        self.unusedJobID = itertools.count()
         self.lastReconciliation = time.time()
         self.reconciliationPeriod = 120
 
@@ -149,10 +154,18 @@ class MesosBatchSystem(BatchSystemSupport,
         self.lastTimeOfferLogged = 0
         self.logPeriod = 30  # seconds
 
+        self.ignoredNodes = set()
+
         self._startDriver()
 
     def setUserScript(self, userScript):
         self.userScript = userScript
+
+    def ignoreNode(self, nodeAddress):
+        self.ignoredNodes.add(nodeAddress)
+
+    def unignoreNode(self, nodeAddress):
+        self.ignoredNodes.remove(nodeAddress)
 
     def issueBatchJob(self, jobNode):
         """
@@ -160,8 +173,11 @@ class MesosBatchSystem(BatchSystemSupport,
         is an int giving the number of bytes the job needs to run in and cores is the number of cpus
         needed for the job and error-file is the path of the file to place any std-err/std-out in.
         """
+        localID = self.handleLocalJob(jobNode)
+        if localID:
+            return localID
         self.checkResourceRequest(jobNode.memory, jobNode.cores, jobNode.disk)
-        jobID = next(self.unusedJobID)
+        jobID = self.getNextJobID()
         job = ToilJob(jobID=jobID,
                       name=str(jobNode),
                       resources=ResourceRequirement(**jobNode._requirements),
@@ -174,12 +190,13 @@ class MesosBatchSystem(BatchSystemSupport,
 
         # TODO: round all elements of resources
 
-        self.jobQueues.insertJob(job, jobType)
         self.taskResources[jobID] = job.resources
+        self.jobQueues.insertJob(job, jobType)
         log.debug("... queued")
         return jobID
 
     def killBatchJobs(self, jobIDs):
+        self.killLocalJobs(jobIDs)
         # FIXME: probably still racy
         assert self.driver is not None
         localSet = set()
@@ -205,16 +222,20 @@ class MesosBatchSystem(BatchSystemSupport,
 
     def getIssuedBatchJobIDs(self):
         jobIds = set(self.jobQueues.jobIDs())
-        jobIds.update(self.runningJobMap.keys())
-        return list(jobIds)
+        jobIds.update(list(self.runningJobMap.keys()))
+        return list(jobIds) + list(self.getIssuedLocalJobIDs())
 
     def getRunningBatchJobIDs(self):
         currentTime = dict()
-        for jobID, data in self.runningJobMap.items():
+        for jobID, data in list(self.runningJobMap.items()):
             currentTime[jobID] = time.time() - data.startTime
+        currentTime.update(self.getRunningLocalJobIDs())
         return currentTime
 
     def getUpdatedBatchJob(self, maxWait):
+        local_tuple = self.getUpdatedLocalJob(0)
+        if local_tuple:
+            return local_tuple
         while True:
             try:
                 item = self.updatedJobsQueue.get(timeout=maxWait)
@@ -245,10 +266,6 @@ class MesosBatchSystem(BatchSystemSupport,
         missing/overlong jobs.
         """
         return self.reconciliationPeriod
-
-    @classmethod
-    def getRescueBatchJobFrequency(cls):
-        return 30 * 60  # Half an hour
 
     def _buildExecutor(self):
         """
@@ -299,6 +316,7 @@ class MesosBatchSystem(BatchSystemSupport,
         return ':'.join(address)
 
     def shutdown(self):
+        self.shutdownLocal()
         log.debug("Stopping Mesos driver")
         self.driver.stop()
         log.debug("Joining Mesos driver")
@@ -382,6 +400,11 @@ class MesosBatchSystem(BatchSystemSupport,
         unableToRun = True
         # Right now, gives priority to largest jobs
         for offer in offers:
+            if offer.hostname in self.ignoredNodes:
+                log.debug("Declining offer %s because node %s is designated for termination" %
+                        (offer.id.value, offer.hostname))
+                driver.declineOffer(offer.id)
+                continue
             runnableTasks = []
             # TODO: In an offer, can there ever be more than one resource with the same name?
             offerCores, offerMemory, offerDisk, offerPreemptable = self._parseOffer(offer)
@@ -417,7 +440,8 @@ class MesosBatchSystem(BatchSystemSupport,
                     remainingMemory -= toMiB(jobType.memory)
                     remainingDisk -= toMiB(jobType.disk)
                     nextToLaunchIndex += 1
-                else:
+                if not self.jobQueues.typeEmpty(jobType):
+                    # report that remaining jobs cannot be run with the current resourcesq:
                     log.debug('Offer %(offer)s not suitable to run the tasks with requirements '
                               '%(requirements)r. Mesos offered %(memory)s memory, %(cores)s cores '
                               'and %(disk)s of disk on a %(non)spreemptable slave.',
@@ -447,7 +471,11 @@ class MesosBatchSystem(BatchSystemSupport,
 
     def _trackOfferedNodes(self, offers):
         for offer in offers:
-            nodeAddress = socket.gethostbyname(offer.hostname)
+            try:
+                nodeAddress = socket.gethostbyname(offer.hostname)
+            except:
+                log.deug("Failed to resolve hostname %s" % offer.hostname)
+                raise
             self._registerNode(nodeAddress, offer.slave_id.value)
             preemptable = False
             for attribute in offer.attributes:
@@ -465,8 +493,8 @@ class MesosBatchSystem(BatchSystemSupport,
         if not self.nodeFilter:
             return offers
         executorInfoOrNone = [self.executors.get(socket.gethostbyname(offer.hostname)) for offer in offers]
-        executorInfos = filter(None, executorInfoOrNone)
-        executorsToConsider = filter(self.nodeFilter[0], executorInfos)
+        executorInfos = [_f for _f in executorInfoOrNone if _f]
+        executorsToConsider = list(filter(self.nodeFilter[0], executorInfos))
         ipsToConsider = {ex.nodeAddress for ex in executorsToConsider}
         return [offer for offer in offers if socket.gethostbyname(offer.hostname) in ipsToConsider]
 
@@ -595,7 +623,7 @@ class MesosBatchSystem(BatchSystemSupport,
         return executor
 
     def getNodes(self, preemptable=None, timeout=600):
-        timeout = timeout or sys.maxint
+        timeout = timeout or sys.maxsize
         return {nodeAddress: executor.nodeInfo
                 for nodeAddress, executor in iteritems(self.executors)
                 if time.time() - executor.lastSeen < timeout
@@ -614,11 +642,10 @@ class MesosBatchSystem(BatchSystemSupport,
         """
         log.warning("Executor '%s' lost.", executorId)
 
-
     @classmethod
     def setOptions(cl, setOption):
         setOption("mesosMasterAddress", None, None, 'localhost:5050')
-        
+
 
 def toMiB(n):
     return n / 1024 / 1024

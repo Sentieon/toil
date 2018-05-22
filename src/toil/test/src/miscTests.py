@@ -13,16 +13,23 @@
 # limitations under the License.
 
 from __future__ import absolute_import, print_function
-from toil.test import ToilTest
+from future.utils import raise_
+from builtins import range
+from toil.test import ToilTest, slow
 from uuid import uuid4
 
-import math
+import inspect
+import sys
+from toil.lib.exceptions import panic
+
 import os
 import random
 import tempfile
+import logging
 
-# Python 3 compatibility imports
-from six.moves import xrange
+
+log = logging.getLogger(__name__)
+logging.basicConfig()
 
 class MiscTests(ToilTest):
     """
@@ -33,32 +40,23 @@ class MiscTests(ToilTest):
         super(MiscTests, self).setUp()
         self.testDir = self._createTempDir()
 
+    @slow
     def testGetSizeOfDirectoryWorks(self):
+        '''A test to make sure toil.common.getDirSizeRecursively does not
+        underestimate the amount of disk space needed.
+
+        Disk space allocation varies from system to system.  The computed value
+        should always be equal to or slightly greater than the creation value.
+        This test generates a number of random directories and randomly sized
+        files to test this using getDirSizeRecursively.
+        '''
         from toil.common import getDirSizeRecursively
-        # os.stat lists the number of 512-byte blocks used, but really, the file system is using
-        # a blocksize specific to itself.  For instance, my machine uses 4096-byte blocks.
-        #
-        #  >>> with open('/tmp/temp', 'w') as fileHandle:
-        #  ...     fileHandle.write(os.urandom(512*3))
-        #  ...
-        #  >>> os.stat('/tmp/temp').st_blksize
-        #  4096
-        #  >>> os.stat('/tmp/temp')
-        #  posix.stat_result(st_mode=33188, st_ino=2630547, st_dev=16777220, st_nlink=1, st_uid=501,
-        #                    st_gid=0, st_size=1536, st_atime=1475620048, st_mtime=1475628030,
-        #                    st_ctime=1475628030)
-        #  >>> os.stat('/tmp/temp').st_blocks
-        #  8
-        #
-        # Even though the file is just 3 * 512 bytes, the file system uses one 4096-byte block and
-        # os.stat says it is using eight 512-byte blocks.
-        systemBlockSize = os.stat('.').st_blksize
         # a list of the directories used in the test
         directories = [self.testDir]
         # A dict of {FILENAME: FILESIZE} for all files used in the test
         files = {}
         # Create a random directory structure
-        for i in xrange(0,10):
+        for i in range(0,10):
             directories.append(tempfile.mkdtemp(dir=random.choice(directories), prefix='test'))
         # Create 50 random file entries in different locations in the directories. 75% of the time
         # these are fresh files of sixe [1, 10] MB and 25% of the time they are hard links to old
@@ -70,20 +68,90 @@ class MiscTests(ToilTest):
                 fileSize = int(round(random.random(), 2) * 10 * 1024 * 1024)
                 with open(fileName, 'w') as fileHandle:
                     fileHandle.write(os.urandom(fileSize))
-                files[fileName] = int(math.ceil(fileSize * 1.0 / systemBlockSize) * systemBlockSize)
+                files[fileName] = fileSize
             else:
                 # Link to one of the previous files
                 if len(files) == 0:
                     continue
-                linkSrc = random.choice(files.keys())
+                linkSrc = random.choice(list(files.keys()))
                 os.link(linkSrc, fileName)
                 files[fileName] = 'Link to %s' % linkSrc
 
         computedDirectorySize = getDirSizeRecursively(self.testDir)
-        totalExpectedSize = sum([x for x in files.values() if isinstance(x, int)])
-        self.assertEqual(computedDirectorySize, totalExpectedSize)
+        totalExpectedSize = sum([x for x in list(files.values()) if isinstance(x, int)])
+        self.assertGreaterEqual(computedDirectorySize, totalExpectedSize)
 
     @staticmethod
     def _getRandomName():
         return uuid4().hex
 
+
+class TestPanic(ToilTest):
+    def test_panic_by_hand(self):
+        try:
+            self.try_and_panic_by_hand()
+        except:
+            self.__assert_raised_exception_is_primary()
+
+    def test_panic(self):
+        try:
+            self.try_and_panic()
+        except:
+            self.__assert_raised_exception_is_primary()
+
+    def test_panic_with_secondary(self):
+        try:
+            self.try_and_panic_with_secondary()
+        except:
+            self.__assert_raised_exception_is_primary()
+
+    def test_nested_panic(self):
+        try:
+            self.try_and_nested_panic_with_secondary()
+        except:
+            self.__assert_raised_exception_is_primary()
+
+    def try_and_panic_by_hand(self):
+        try:
+            self.line_of_primary_exc = inspect.currentframe().f_lineno + 1
+            raise ValueError("primary")
+        except Exception:
+            exc_type, exc_value, exc_traceback = sys.exc_info()
+            try:
+                raise RuntimeError("secondary")
+            except Exception:
+                pass
+            raise_(exc_type, exc_value, exc_traceback)
+
+    def try_and_panic(self):
+        try:
+            self.line_of_primary_exc = inspect.currentframe().f_lineno + 1
+            raise ValueError("primary")
+        except:
+            with panic(log):
+                pass
+
+    def try_and_panic_with_secondary(self):
+        try:
+            self.line_of_primary_exc = inspect.currentframe().f_lineno + 1
+            raise ValueError("primary")
+        except:
+            with panic( log ):
+                raise RuntimeError("secondary")
+
+    def try_and_nested_panic_with_secondary(self):
+        try:
+            self.line_of_primary_exc = inspect.currentframe().f_lineno + 1
+            raise ValueError("primary")
+        except:
+            with panic( log ):
+                with panic( log ):
+                    raise RuntimeError("secondary")
+
+    def __assert_raised_exception_is_primary(self):
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        self.assertEquals(exc_type, ValueError)
+        self.assertEquals(str(exc_value), "primary")
+        while exc_traceback.tb_next is not None:
+            exc_traceback = exc_traceback.tb_next
+        self.assertEquals(exc_traceback.tb_lineno, self.line_of_primary_exc)
