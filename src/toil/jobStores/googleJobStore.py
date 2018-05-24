@@ -24,6 +24,7 @@ import uuid
 import logging
 import time
 import os
+import subprocess
 
 try:
     import cPickle as pickle
@@ -124,7 +125,12 @@ class GoogleJobStore(AbstractJobStore):
     @googleRetry
     def initialize(self, config=None):
         try:
-            self.bucket = self.storageClient.create_bucket(self.bucketName)
+            bucket_region = os.environ.get('BUCKET_REGION', None)
+            if bucket_region: # create regional bucket using gsutil
+                subprocess.check_call(['gsutil', 'mb', '-c', 'regional', '-l', bucket_region, 'gs://'+self.bucketName])
+                self.bucket = self.storageClient.get_bucket(self.bucketName)
+            else:
+                self.bucket = self.storageClient.create_bucket(self.bucketName)
         except exceptions.Conflict:
             raise JobStoreExistsException(self.locator)
         super(GoogleJobStore, self).initialize(config)
@@ -218,8 +224,14 @@ class GoogleJobStore(AbstractJobStore):
 
     def writeFile(self, localFilePath, jobStoreID=None):
         fileID = self._newID(isFile=True, jobStoreID=jobStoreID)
-        with open(localFilePath) as f:
-            self._writeFile(fileID, f)
+        t0 = time.time()
+        if os.stat(localFilePath).st_size < 100*1024*1024:
+            with open(localFilePath) as f:
+                self._writeFile(fileID, f)
+        else:
+            subprocess.check_call(["gsutil", "-o", "GSUtil:parallel_composite_upload_threshold=150M", "cp", localFilePath, "gs://%s/%s"%(self.bucketName, fileID)]) 
+        t = time.time() - t0
+        log.debug("writeFile %s %s in %f sec filesize %ld, rate %.1fMB/s"%(localFilePath, fileID, t, os.stat(localFilePath).st_size, os.stat(localFilePath).st_size/t/1024/1024));
         return fileID
 
     @contextmanager
@@ -237,12 +249,14 @@ class GoogleJobStore(AbstractJobStore):
     def readFile(self, jobStoreFileID, localFilePath, symlink=False):
         # used on non-shared files which will be encrypted if available
         # checking for JobStoreID existence
+        t0 = time.time()
         if not self.fileExists(jobStoreFileID):
             raise NoSuchFileException(jobStoreFileID)
         with open(localFilePath, 'w') as writeable:
             blob = self.bucket.get_blob(bytes(jobStoreFileID), encryption_key=self.sseKey)
             blob.download_to_file(writeable)
-
+        t = time.time() - t0
+        log.debug("readFile %s %s in %f sec filesize %ld, rate %.1fMB/s"%(jobStoreFileID, localFilePath, t, os.stat(localFilePath).st_size, os.stat(localFilePath).st_size/t/1024/1024));
     @contextmanager
     def readFileStream(self, jobStoreFileID):
         with self.readSharedFileStream(jobStoreFileID, isProtected=True) as readable:
