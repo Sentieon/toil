@@ -109,6 +109,30 @@ class GCEProvisioner(AbstractProvisioner):
         self._masterPublicKey = None
         self._gceDriver = self._getDriver()
 
+    # ref to https://cloud.google.com/compute/docs/reference/rest/v1/instanceTemplates#resource
+    def _addDisks(self, disks, disk_types):
+        """
+        Add extra disks, format: "disktype:size:number", for example, "local-ssd:375:2", size in GB
+        Multiple disks will be striped, and mounted under "/" (refer to cloudConfigTemplate in abstractProvisioner.py)
+        """
+        import copy
+        a = disk_types.split(':')
+        if len(a) != 3 or int(a[1]) <= 0 or int(a[2]) < 1:
+            raise RuntimeError('disk types expect \"disktype:size:number\" format')
+        disk = {}
+        disk['initializeParams'] = {}
+        disk['initializeParams']['diskType'] = bytes('zones/%s/diskTypes/%s'%(self._zone,a[0]))
+        disk['initializeParams']['diskSizeGb'] = int(a[1])
+        disk['boot'] = False
+        disk['autoDelete'] = True
+        disk['deviceName'] = bytes('xvdb')
+        disk['type'] = 'SCRATCH'
+        disks.append(disk)
+        for i in xrange(1, int(a[2])):
+            diskb = copy.deepcopy(disk)
+            diskb['deviceName'] = bytes('xvd'+str(unichr(ord('b')+i)))
+            disks.append(diskb)
+        
 
     def launchCluster(self, leaderNodeType, leaderStorage, owner, **kwargs):
         """
@@ -146,13 +170,20 @@ class GCEProvisioner(AbstractProvisioner):
             'diskSizeGb' : leaderStorage }
         disk.update({'boot': True,
              'autoDelete': True })
+        disks = [disk]
+        dt = os.environ.get('LEADER_DISK_TYPES', None)
+        if dt:
+            self._addDisks(disks, dt)
+            logger.info("leader disks:")
+            logger.info(json.dumps(disks))
+
         name= 'l' + bytes(uuid.uuid4())
         leader = self._gceDriver.create_node(name, leaderNodeType, imageType,
                                             location=self._zone,
                                             ex_service_accounts=sa_scopes,
                                             ex_metadata=metadata,
                                             ex_subnetwork=self._vpcSubnet,
-                                            ex_disks_gce_struct = [disk],
+                                            ex_disks_gce_struct = disks,
                                             description=self._tags,
                                             ex_preemptible=False)
 
@@ -252,6 +283,12 @@ class GCEProvisioner(AbstractProvisioner):
             'diskSizeGb' : self._nodeStorage }
         disk.update({'boot': True,
              'autoDelete': True })
+        disks = [disk]
+        dt = os.environ.get('NODE_DISK_TYPES', None)
+        if dt:
+            self._addDisks(disks, dt)
+            logger.info("node disks:")
+            logger.info(json.dumps(disks))
 
         # TODO:
         #  - bug in gce.py for ex_create_multiple_nodes (erroneously, doesn't allow image and disk to specified)
@@ -268,7 +305,7 @@ class GCEProvisioner(AbstractProvisioner):
                                     location=self._zone,
                                     ex_service_accounts=sa_scopes,
                                     ex_metadata=metadata,
-                                    ex_disks_gce_struct = [disk],
+                                    ex_disks_gce_struct = disks,
                                     description=self._tags,
                                     ex_preemptible = preemptable
                                     )

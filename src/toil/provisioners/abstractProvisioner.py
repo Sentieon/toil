@@ -261,7 +261,7 @@ write_files:
         ephemeral_count=0
         drives=""
         directories="toil mesos docker cwl"
-        for drive in /dev/xvd{{b..z}} /dev/nvme*n*; do
+        for drive in /dev/disk/by-id/google-xvd{{b..z}} /dev/xvd{{b..z}} /dev/nvme*n*; do
             echo checking for $drive
             if [ -b $drive ]; then
                 echo found it
@@ -334,6 +334,7 @@ coreos:
             -v /var/lib/toil:/var/lib/toil \
             -v /var/lib/cwl:/var/lib/cwl \
             -v /tmp:/tmp \
+            -v /dev/shm:/dev/shm \
             --name=toil_{role} \
             {dockerImage} \
             {mesosArgs}
